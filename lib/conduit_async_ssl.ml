@@ -25,13 +25,25 @@ let ssl_connect net_to_ssl ssl_to_net =
   let ssl_to_net = Writer.pipe ssl_to_net in
   let app_to_ssl, app_wr = Pipe.create () in
   let app_rd, ssl_to_app = Pipe.create () in
-  let client =  Ssl.client ~app_to_ssl ~ssl_to_app ~net_to_ssl ~ssl_to_net () in
-  don't_wait_for (client >>= fun _con -> return ());
-  Reader.of_pipe (Info.of_string "async_conduit_ssl_reader") app_rd
-  >>= fun app_rd ->
-  Writer.of_pipe (Info.of_string "async_conduit_ssl_writer") app_wr
-  >>| fun (app_wr,_) ->
-  app_rd, app_wr
+  let client = Ssl.client ~app_to_ssl ~ssl_to_app ~net_to_ssl ~ssl_to_net () in
+  client >>= function
+  | (Error _) as e ->
+    Pipe.close_read app_to_ssl;
+    Pipe.close ssl_to_app;
+    Pipe.close_read net_to_ssl;
+    Pipe.close ssl_to_net;
+    Pipe.close app_wr;
+    Pipe.close_read app_rd;
+    Or_error.ok_exn e
+  | Ok conn ->
+    Reader.of_pipe (Info.of_string "async_conduit_ssl_reader") app_rd
+    >>= fun app_rd' ->
+    Reader.close_finished app_rd' >>> (fun () -> Pipe.close_read app_rd);
+    Writer.of_pipe (Info.of_string "async_conduit_ssl_writer") app_wr
+    >>| fun (app_wr, `Closed_and_flushed_downstream flushed) ->
+    Deferred.both flushed (Reader.close_finished app_rd')
+    >>> (fun (_, _) -> Ssl.Connection.close conn);
+    app_rd', app_wr
 
 let ssl_listen ?(version=Ssl.Version.Tlsv1_2) ~crt_file ~key_file rd wr =
   let net_to_ssl = Reader.pipe rd in
